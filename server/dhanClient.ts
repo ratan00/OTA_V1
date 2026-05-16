@@ -5,10 +5,29 @@ export class DhanClient {
     private clientId: string;
     private accessToken: string;
     private baseUrl = 'https://api.dhan.co';
+    public rateLimitUntil = 0;
 
     constructor(clientId: string, accessToken: string) {
         this.clientId = clientId;
         this.accessToken = accessToken;
+    }
+
+    private checkRateLimit() {
+        if (Date.now() < this.rateLimitUntil) {
+            throw new Error("429 Too Many Requests");
+        }
+    }
+
+    private handleRateLimit(e: any) {
+        const errStr = e.response ? JSON.stringify(e.response.data) : e.message;
+        if (errStr.includes("805") || errStr.includes("Too many requests") || (e.response && e.response.status === 429)) {
+            if (Date.now() > this.rateLimitUntil) {
+                console.warn(`Dhan API rate limit hit. Throttling for 60 seconds.`);
+            }
+            this.rateLimitUntil = Date.now() + 60000; // Block for 60 seconds
+            throw new Error("429 Too Many Requests");
+        }
+        console.error(`Dhan API error:`, errStr);
     }
 
     private get headers() {
@@ -25,14 +44,97 @@ export class DhanClient {
             if (data?.status === 'success' && data.data) return data.data;
             if (data?.data && Object.keys(data).length === 1) return data.data;
             return data;
+        } else if (response?.data?.status === 'failed') {
+            throw new Error(response.data.remarks || response.data.errorType || "Dhan API Failed");
         }
         return null;
     }
 
     async getHistory(securityId: string | number, segment: string, instrumentType: string = 'INDEX', timeframe: number | string = 1) {
         try {
+            this.checkRateLimit();
             const sid = securityId.toString();
             const toDate = new Date();
+            
+            if (timeframe === '1D') {
+                 // Fetch 1 year of daily history + recent intraday for merge
+                 const fromYear = new Date();
+                 fromYear.setFullYear(toDate.getFullYear() - 1);
+                 
+                 const formatD = (d: Date) => d.toISOString().split('T')[0];
+                 const actualInstType = segment === 'NSE_FNO' ? 'OPTIDX' : 'INDEX';
+
+                 const [dailyRes, intradayRes] = await Promise.all([
+                     axios.post(`${this.baseUrl}/charts/historical`, {
+                         securityId: sid, exchangeSegment: segment, instrument: actualInstType, interval: "1D",
+                         fromDate: formatD(fromYear), toDate: formatD(toDate)
+                     }, { headers: this.headers, timeout: 10000 }).catch(e => null),
+                     axios.post(`${this.baseUrl}/charts/historical`, {
+                         securityId: sid, exchangeSegment: segment, instrument: actualInstType, interval: 1,
+                         fromDate: formatD(new Date(toDate.getTime() - 7 * 86400000)), toDate: formatD(toDate)
+                     }, { headers: this.headers, timeout: 10000 }).catch(e => null)
+                 ]);
+
+                 const parseRes = (res: any) => {
+                     let _data = res?.data;
+                     if (typeof _data === 'string') { try{ _data = JSON.parse(_data); }catch(e){} }
+                     if (_data?.data) _data = _data.data;
+                     const ts = _data?.start_Time || _data?.timestamp;
+                     if (!ts || !Array.isArray(ts)) return [];
+                     return ts.map((t: number, i: number) => ({
+                         time: t, open: _data.open[i], high: _data.high[i], low: _data.low[i], close: _data.close[i], volume: _data.volume?.[i] || 0
+                     }));
+                 };
+
+                 const dailyHist = parseRes(dailyRes).filter((b: any) => {
+                     const date = new Date(b.time * 1000);
+                     const istOffset = 330;
+                     const istDate = new Date(date.getTime() + (istOffset * 60000));
+                     const day = istDate.getUTCDay();
+                     return day !== 0 && day !== 6;
+                 });
+                 let intradayHist = parseRes(intradayRes);
+
+                 // Standardize dailyHist times to midnight IST
+                 dailyHist.forEach((b: any) => {
+                     const date = new Date(b.time * 1000);
+                     date.setUTCHours(18, 30, 0, 0); // 00:00:00 IST is 18:30 UTC previous day
+                     if (date.getUTCDate() !== new Date(b.time * 1000).getUTCDate()) {
+                         date.setUTCDate(date.getUTCDate() + 1);
+                     }
+                     b.time = date.getTime() / 1000;
+                 });
+
+                 const todayIntraday = intradayHist.filter((b: any) => {
+                     const date = new Date(b.time * 1000);
+                     const istMinutes = (date.getUTCHours() * 60 + date.getUTCMinutes() + 330) % 1440;
+                     return istMinutes >= 555 && istMinutes <= 930;
+                 }).filter((b: any) => {
+                     const date = new Date(b.time * 1000);
+                     const istOffset = 330;
+                     const istDate = new Date(date.getTime() + (istOffset * 60000));
+                     const day = istDate.getUTCDay();
+                     if (day === 0 || day === 6) return false;
+                     return istDate.toISOString().split('T')[0] === new Date(Date.now() + 330 * 60000).toISOString().split('T')[0];
+                 });
+
+                 if (todayIntraday.length > 0) {
+                     const todayCandle = this.aggregateOhlc(todayIntraday, 99999999)[0];
+                     const todayMidnight = new Date();
+                     todayMidnight.setUTCHours(18, 30, 0, 0);
+                     if (todayMidnight.getTime() > Date.now()) todayMidnight.setDate(todayMidnight.getDate() - 1);
+                     todayCandle.time = todayMidnight.getTime() / 1000;
+                     
+                     const lastDaily = dailyHist[dailyHist.length - 1];
+                     if (lastDaily && lastDaily.time === todayCandle.time) {
+                         dailyHist[dailyHist.length - 1] = todayCandle;
+                     } else {
+                         dailyHist.push(todayCandle);
+                     }
+                 }
+                 return dailyHist;
+            }
+
             // Intraday charts usually support limited lookback. 
             let lookbackDays = 5; 
             const tf = typeof timeframe === 'number' ? timeframe : 1;
@@ -49,11 +151,13 @@ export class DhanClient {
             const actualInstType = segment === 'NSE_FNO' ? 'OPTIDX' : 'INDEX';
 
             const payload = {
-                security_id: sid,
-                segment: segment,
-                instrument_type: actualInstType,
-                from_date: format(fromDate),
-                to_date: format(toDate)
+                securityId: sid,
+                exchangeSegment: segment,
+                instrument: actualInstType,
+                interval: 1, // we aggregate this ourselves later if needed
+                oi: false,
+                fromDate: format(fromDate).split(' ')[0],
+                toDate: format(toDate).split(' ')[0]
             };
 
             const response = await axios.post(`${this.baseUrl}/v2/charts/intraday`, payload, { 
@@ -61,27 +165,38 @@ export class DhanClient {
                 timeout: 10000 
             });
 
-            const unwrapped = this.unwrap(response.data);
-            if (!unwrapped?.timestamp) {
-                if (response.data?.status === 'failed' || response.data?.data?.status === 'failed') {
-                    const err = response.data?.remarks || response.data?.data?.remarks || response.data?.errors;
-                    console.warn(`Dhan getHistory failed for ${sid}:`, err);
-                }
+            let dataObj = response.data;
+            if (typeof dataObj === 'string') {
+               try { dataObj = JSON.parse(dataObj); } catch(e){}
+            }
+            if (dataObj && dataObj.status === 'success' && dataObj.data) {
+               dataObj = dataObj.data;
+            }
+            
+            const tsArray = dataObj?.start_Time || dataObj?.timestamp;
+            if (!tsArray || !Array.isArray(tsArray)) {
+                console.warn(`Dhan getHistory missing timestamp array. Keys:`, dataObj ? Object.keys(dataObj) : "null");
                 return [];
             }
 
-            const history = unwrapped.timestamp.map((t: number, i: number) => ({
+            const history = tsArray.map((t: number, i: number) => ({
                 time: t,
-                open: unwrapped.open[i],
-                high: unwrapped.high[i],
-                low: unwrapped.low[i],
-                close: unwrapped.close[i],
-                volume: unwrapped.volume?.[i] || 0
+                open: dataObj.open[i],
+                high: dataObj.high[i],
+                low: dataObj.low[i],
+                close: dataObj.close[i],
+                volume: dataObj.volume?.[i] || 0
             }));
 
-            // IST filter (09:15 - 15:30)
+            // IST filter (09:15 - 15:30) and Weekend check
             const filtered = history.filter((b: any) => {
+                // Remove weekend candles:
                 const date = new Date(b.time * 1000);
+                const istOffset = 330;
+                const istDate = new Date(date.getTime() + (istOffset * 60000));
+                const day = istDate.getUTCDay();
+                if (day === 0 || day === 6) return false;
+
                 const istMinutes = (date.getUTCHours() * 60 + date.getUTCMinutes() + 330) % 1440;
                 return istMinutes >= 555 && istMinutes <= 930;
             });
@@ -90,6 +205,7 @@ export class DhanClient {
 
             return this.aggregateOhlc(filtered, tf);
         } catch (e) {
+            this.handleRateLimit(e);
             console.error(`Dhan getHistory error:`, e);
             return [];
         }
@@ -119,16 +235,12 @@ export class DhanClient {
 
     async getOptionChain(securityId: number, segment: string, expiry: string) {
         try {
+            this.checkRateLimit();
             // Updated payload for V2 Option Chain
             const payload = {
-                underlying_external_id: securityId.toString(),
-                underlying_segment: segment,
-                expiry_date: expiry,
-                // fallback fields
-                security_id: securityId.toString(),
-                segment: segment,
-                underlying_id: securityId.toString(),
-                underlying_segment_id: segment
+                UnderlyingScrip: securityId,
+                UnderlyingSeg: segment,
+                Expiry: expiry
             };
 
             const response = await axios.post(`${this.baseUrl}/v2/optionchain`, payload, { 
@@ -179,24 +291,20 @@ export class DhanClient {
             }
 
             return rows.sort((a, b) => a.Strike - b.Strike);
-        } catch (e) {
-            console.error(`Dhan getOptionChain error:`, e);
+        } catch (e: any) {
+            this.handleRateLimit(e);
             return [];
         }
     }
 
     async getExpiryList(securityId: number, segment: string) {
         try {
+            this.checkRateLimit();
             const payload = {
-                underlying_external_id: securityId.toString(),
-                underlying_segment: segment,
-                // Fallback fields
-                security_id: securityId.toString(),
-                segment: segment,
-                underlying_id: securityId.toString(),
-                underlying_segment_id: segment
+                UnderlyingScrip: securityId,
+                UnderlyingSeg: segment
             };
-            const response = await axios.post(`${this.baseUrl}/v2/optionchain/expy`, payload, { 
+            const response = await axios.post(`${this.baseUrl}/v2/optionchain/expirylist`, payload, { 
                 headers: this.headers,
                 timeout: 10000
             });
@@ -204,7 +312,11 @@ export class DhanClient {
             const unwrapped = this.unwrap(response.data);
             if (Array.isArray(unwrapped) && unwrapped.length > 0) return unwrapped;
             return this.getFallbackExpiries();
-        } catch (e) {
+        } catch (e: any) {
+            try { this.handleRateLimit(e); } catch(err) { throw err; } // throw 429
+            if (e.response?.status === 401 || e.response?.status === 403) {
+                throw new Error("Invalid Dhan credentials");
+            }
             return this.getFallbackExpiries();
         }
     }
@@ -224,6 +336,7 @@ export class DhanClient {
 
     async getQuote(securityIds: string[], segment: string = 'IDX_I') {
         try {
+            this.checkRateLimit();
             // New V2 format: { instruments: [ { segmentId, securityId } ] }
             const response = await axios.post(`${this.baseUrl}/v2/marketfeed/quote`, {
                 instruments: securityIds.map(id => ({
@@ -243,12 +356,14 @@ export class DhanClient {
             }
             return unwrapped;
         } catch (e) {
+            this.handleRateLimit(e);
             return null;
         }
     }
 
     async getOhlc(securityIds: string[], segment: string = 'IDX_I') {
         try {
+            this.checkRateLimit();
             const response = await axios.post(`${this.baseUrl}/v2/marketfeed/ohlc`, {
                 instruments: securityIds.map(id => ({
                     segmentId: segment,
@@ -257,6 +372,7 @@ export class DhanClient {
             }, { headers: this.headers });
             return this.unwrap(response.data);
         } catch (e) {
+            this.handleRateLimit(e);
             return null;
         }
     }

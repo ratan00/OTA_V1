@@ -12,7 +12,13 @@ dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+import fs from "fs";
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+function debug_log(msg: string) {
+    console.log(msg);
+    fs.appendFileSync(path.join(process.cwd(), "debug.log"), msg + "\n");
+}
 
 const PORT = 3000;
 
@@ -193,8 +199,8 @@ app.get("/api/cache/clear", async (req, res) => {
 });
 
 // --- WebSocket Streaming Loop ---
-wss.on("connection", (ws: any) => {
-    console.log("New terminal client connected");
+wss.on("connection", (ws: any, req: any) => {
+    debug_log("New terminal client connected from " + req.socket.remoteAddress);
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
@@ -211,10 +217,14 @@ wss.on("connection", (ws: any) => {
     let lastChainUpdate = 0;
     const CHAIN_REFRESH_MS = 60000; // Refresh option chain every 60 seconds to avoid 429
     let cachedChain: any[] = [];
+    let cachedAggGex: any[] = [];
+    let lastAggGexUpdate = 0;
+    let formingCandle: any = null;
     const lastSpotMap = new Map<string, number>();
 
     const streamLoop = async () => {
         try {
+            console.log("streamLoop started");
             const mStatus = getMarketStatus();
             const activeIdx = INDEX_CONFIG[currentConfig.indexId];
             
@@ -222,10 +232,13 @@ wss.on("connection", (ws: any) => {
             if (dhan) {
                 try {
                     const indexIds = Object.values(INDEX_CONFIG).map(c => c.dhan_id);
-                    // For quotes, Dhan usually expects segmentId as NSE_INDEX or IDX_I
+                    debug_log("Fetching quotes...");
                     quotesRes = await dhan.getQuote(indexIds, activeIdx.seg || "IDX_I");
-                } catch (e) {
-                    console.error("Dhan Quote Error:", e);
+                    debug_log("Quotes fetched.");
+                } catch (e: any) {
+                    if (!e.message?.includes('429')) {
+                        debug_log("Dhan Quote Error: " + e.message);
+                    }
                 }
             }
 
@@ -233,7 +246,6 @@ wss.on("connection", (ws: any) => {
                 let lp = lastSpotMap.get(id) || 0;
                 let prevClose = lp;
                 
-                // Dhan Quote API v2 can return data flattened or nested by segment
                 const q = quotesRes?.[cfg.dhan_id] || quotesRes?.["IDX_I"]?.[cfg.dhan_id] || quotesRes?.["NSE_INDEX"]?.[cfg.dhan_id];
                 
                 if (q) {
@@ -247,28 +259,58 @@ wss.on("connection", (ws: any) => {
             });
             ws.send(JSON.stringify({ type: 'indices_spot', data: idxSpot }));
 
+            let chartLp = idxSpot.find(i => i.id === currentConfig.indexId)?.spot || 0;
+            if (!mStatus.on) {
+                formingCandle = null;
+            } else if (chartLp > 0) {
+                const nowTs = Math.floor(Date.now() / 1000);
+                let nowFloor = 0;
+                if (currentConfig.timeframe === '1D') {
+                    const istOffset = 5.5 * 3600;
+                    nowFloor = Math.floor((nowTs + istOffset) / 86400) * 86400 - istOffset;
+                } else {
+                    const windowSec = Number(currentConfig.timeframe) * 60;
+                    nowFloor = Math.floor(nowTs / windowSec) * windowSec;
+                }
+                if (!formingCandle || nowFloor > formingCandle.time) {
+                    formingCandle = { time: nowFloor, open: chartLp, high: chartLp, low: chartLp, close: chartLp, volume: 0 };
+                } else {
+                    formingCandle.high = Math.max(formingCandle.high, chartLp);
+                    formingCandle.low = Math.min(formingCandle.low, chartLp);
+                    formingCandle.close = chartLp;
+                }
+            }
+
             if (currentConfig.moduleConfig.optionChain || currentConfig.moduleConfig.gexProfile || currentConfig.moduleConfig.combinedGex) {
-                let spot = idxSpot.find(i => i.id === currentConfig.indexId)?.spot || 0;
+                let spot = chartLp;
                 const now = Date.now();
 
+                debug_log(`Check chain: dhan=${!!dhan}, expiry=${currentConfig.expiry}`);
+                
                 if (dhan && currentConfig.expiry && (now - lastChainUpdate > CHAIN_REFRESH_MS || cachedChain.length === 0)) {
                     try {
-                        // Add a small delay between Quote and OptionChain calls
+                        debug_log("Fetching option chain...");
                         await new Promise(resolve => setTimeout(resolve, 500)); 
                         
                         const newChain = await dhan.getOptionChain(Number(activeIdx.dhan_id), activeIdx.seg || "IDX_I", currentConfig.expiry);
+                        debug_log("Option chain length = " + (newChain ? newChain.length : 0));
                         if (newChain && newChain.length > 0) {
                             cachedChain = newChain;
                             lastChainUpdate = now;
                         }
                     } catch (e: any) {
-                        console.error("Dhan Chain Error:", e.message || e);
+                        if (e.message && e.message.includes('429')) {
+                            lastChainUpdate = now; // Skip until next cycle if rate limited
+                        } else {
+                            debug_log("Dhan Chain Error: " + (e.message || e));
+                        }
                     }
                 } 
                 
-                const chain = cachedChain;
+                let chain = cachedChain;
                 
                 if (chain && chain.length > 0) {
+                    debug_log("Processing chain and sending data...");
                     if (spot === 0) spot = chain[Math.floor(chain.length/2)].Strike;
                     
                     // Calculate DTE
@@ -291,11 +333,57 @@ wss.on("connection", (ws: any) => {
                     const { pcr, maxPain } = computePcrAndMaxPain(chain);
                     const { callWall, putWall, regime } = computeWallsAndRegime(chain.map(r => ({ ...r, netGex: (r.Call_Gamma * r.Call_OI) - (r.Put_Gamma * r.Put_OI), callOi: r.Call_OI, putOi: r.Put_OI })));
 
+                    let aggGex = cachedAggGex;
+                    if (currentConfig.moduleConfig.combinedGex && dhan) {
+                        if (now - lastAggGexUpdate > 60000 || cachedAggGex.length === 0) {
+                            try {
+                                const exps = await dhan.getExpiryList(Number(activeIdx.dhan_id), activeIdx.seg || "IDX_I");
+                                const nextExps = exps.slice(0, 4);
+                                let combinedRaw: any[] = [];
+                                for (const exp of nextExps) {
+                                    await new Promise(r => setTimeout(r, 1000)); // sleep 1 sec
+                                    const expChain = await dhan.getOptionChain(Number(activeIdx.dhan_id), activeIdx.seg || "IDX_I", exp);
+                                    if (!expChain) continue;
+                                    let expDte = 5;
+                                    try {
+                                        expDte = Math.max(0.1, (new Date(exp).getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+                                    } catch(e) {}
+                                    const ceGex = expChain.map((r:any) => ({ strike: r.Strike, type: 'CE' as const, oi: r.Call_OI, gamma: r.Call_Gamma }));
+                                    const peGex = expChain.map((r:any) => ({ strike: r.Strike, type: 'PE' as const, oi: r.Put_OI, gamma: r.Put_Gamma }));
+                                    const expGexData = computeGex([...ceGex, ...peGex] as any, spot, expDte, activeIdx.lot);
+                                    combinedRaw.push(...expGexData);
+                                    await new Promise(r => setTimeout(r, 200));
+                                }
+                                
+                                const strikeMap = new Map<number, any>();
+                                for(const g of combinedRaw) {
+                                    if(!strikeMap.has(g.strike)) strikeMap.set(g.strike, { strike: g.strike, callGex: 0, putGex: 0, netGex: 0 });
+                                    const cur = strikeMap.get(g.strike);
+                                    cur.callGex += g.callGex;
+                                    cur.putGex += g.putGex;
+                                    cur.netGex += g.netGex;
+                                }
+                                const arr = Array.from(strikeMap.values()).sort((a,b) => a.strike - b.strike);
+                                cachedAggGex = arr.slice(Math.max(0, Math.floor(arr.length/2 - currentConfig.gexNum/2)), Math.floor(arr.length/2 + currentConfig.gexNum/2));
+                                lastAggGexUpdate = now;
+                                aggGex = cachedAggGex;
+                            } catch(e: any) {
+                                if (e.message && e.message.includes('429')) {
+                                    lastAggGexUpdate = now;
+                                } else {
+                                    debug_log("AggGex Error: "+e.message);
+                                }
+                            }
+                        }
+                    }
+
                     ws.send(JSON.stringify({
                         type: 'data',
                         spot,
+                        ohlc: formingCandle,
                         chain: chain.slice(Math.max(0, Math.floor(chain.length/2 - currentConfig.gexNum/2)), Math.floor(chain.length/2 + currentConfig.gexNum/2)),
                         gex: gexData,
+                        agg_gex: aggGex,
                         pcr,
                         max_pain: maxPain,
                         call_wall: callWall,
@@ -308,6 +396,7 @@ wss.on("connection", (ws: any) => {
                     ws.send(JSON.stringify({
                         type: 'data',
                         spot,
+                        ohlc: formingCandle,
                         chain: [],
                         market_status: mStatus.status,
                         market_on: mStatus.on
@@ -317,12 +406,13 @@ wss.on("connection", (ws: any) => {
                 ws.send(JSON.stringify({
                     type: 'data',
                     spot: idxSpot.find(i => i.id === currentConfig.indexId)?.spot || 0,
+                    ohlc: formingCandle,
                     market_status: mStatus.status,
                     market_on: mStatus.on
                 }));
             }
-        } catch (e) {
-            console.error("WS Loop Error:", e);
+        } catch (e: any) {
+            debug_log("WS Loop Error: " + (e.message || e));
         }
     };
     
@@ -333,21 +423,40 @@ wss.on("connection", (ws: any) => {
     ws.on("message", async (msg: string) => {
         try {
             const payload = JSON.parse(msg);
+            debug_log("WS MESSAGE: " + payload.type);
             if (payload.type === 'auth') {
-                const { client_id, access_token } = payload.payload;
-                dhan = new DhanClient(client_id, access_token);
-                const exps = await dhan.getExpiryList(Number(INDEX_CONFIG[currentConfig.indexId].dhan_id), INDEX_CONFIG[currentConfig.indexId].seg);
-                currentConfig.expiry = exps[0];
-                ws.send(JSON.stringify({ type: 'expiries', data: exps }));
-                
-                const hist = await dhan.getHistory(INDEX_CONFIG[currentConfig.indexId].dhan_id, INDEX_CONFIG[currentConfig.indexId].seg, "INDEX", currentConfig.timeframe);
-                ws.send(JSON.stringify({ type: 'history', data: hist, target: 'chart', name: INDEX_CONFIG[currentConfig.indexId].name }));
+                try {
+                    const { client_id, access_token } = payload.payload;
+                    dhan = new DhanClient(client_id, access_token);
+                    
+                    try {
+                        const payloadBase64 = access_token.split('.')[1];
+                        if (payloadBase64) {
+                            const jwtData = JSON.parse(Buffer.from(payloadBase64, 'base64').toString('utf8'));
+                            if (jwtData.exp) {
+                                const secondsLeft = jwtData.exp - Math.floor(Date.now() / 1000);
+                                if (secondsLeft < 3600) {
+                                    ws.send(JSON.stringify({ type: 'warning', message: `Dhan token expires in ${Math.floor(secondsLeft / 60)} mins. Renew in settings.` }));
+                                }
+                            }
+                        }
+                    } catch(e) {}
 
-                if (intervalId) clearInterval(intervalId);
-                intervalId = setInterval(streamLoop, 5000); // 5s interval to avoid 429
-                
-                // Force immediate update with new dhan client
-                streamLoop();
+                    const exps = await dhan.getExpiryList(Number(INDEX_CONFIG[currentConfig.indexId].dhan_id), INDEX_CONFIG[currentConfig.indexId].seg);
+                    currentConfig.expiry = exps[0];
+                    ws.send(JSON.stringify({ type: 'expiries', data: exps }));
+                    
+                    let hist = await dhan.getHistory(INDEX_CONFIG[currentConfig.indexId].dhan_id, INDEX_CONFIG[currentConfig.indexId].seg, "INDEX", currentConfig.timeframe);
+                    hist = hist || [];
+                    ws.send(JSON.stringify({ type: 'history', data: hist, target: 'chart', name: INDEX_CONFIG[currentConfig.indexId].name }));
+
+                    if (intervalId) clearInterval(intervalId);
+                    intervalId = setInterval(streamLoop, 5000); // 5s interval to avoid 429
+                    
+                    streamLoop();
+                } catch (err: any) {
+                    ws.send(JSON.stringify({ type: 'error', message: err.message || "Failed to authenticate with Dhan" }));
+                }
             } else if (payload.type === 'module_config') {
                 currentConfig.moduleConfig = { ...currentConfig.moduleConfig, ...payload.payload };
             } else if (payload.type === 'index_change') {
@@ -356,20 +465,36 @@ wss.on("connection", (ws: any) => {
                     const exps = await dhan.getExpiryList(Number(INDEX_CONFIG[currentConfig.indexId].dhan_id), INDEX_CONFIG[currentConfig.indexId].seg);
                     currentConfig.expiry = exps[0];
                     ws.send(JSON.stringify({ type: 'expiries', data: exps }));
-                    const hist = await dhan.getHistory(INDEX_CONFIG[currentConfig.indexId].dhan_id, INDEX_CONFIG[currentConfig.indexId].seg, "INDEX", currentConfig.timeframe);
+                    
+                    let hist = await dhan.getHistory(INDEX_CONFIG[currentConfig.indexId].dhan_id, INDEX_CONFIG[currentConfig.indexId].seg, "INDEX", currentConfig.timeframe);
+                    hist = hist || [];
                     ws.send(JSON.stringify({ type: 'history', data: hist, target: 'chart', name: INDEX_CONFIG[currentConfig.indexId].name }));
                 }
             } else if (payload.type === 'timeframe_change') {
                 currentConfig.timeframe = payload.timeframe;
                 if (dhan) {
-                    const hist = await dhan.getHistory(INDEX_CONFIG[currentConfig.indexId].dhan_id, INDEX_CONFIG[currentConfig.indexId].seg, "INDEX", currentConfig.timeframe);
+                    let hist = await dhan.getHistory(INDEX_CONFIG[currentConfig.indexId].dhan_id, INDEX_CONFIG[currentConfig.indexId].seg, "INDEX", currentConfig.timeframe);
+                    hist = hist || [];
                     ws.send(JSON.stringify({ type: 'history', data: hist, target: 'chart', name: INDEX_CONFIG[currentConfig.indexId].name }));
                 }
+            } else if (payload.type === 'select_expiry' || payload.type === 'expiry_change') {
+                currentConfig.expiry = payload.payload || payload.expiry;
+                cachedChain = [];
+                lastChainUpdate = 0;
+                streamLoop();
+            } else if (payload.type === 'select_gex_strikes') {
+                currentConfig.gexNum = payload.payload;
+            } else if (payload.type === 'select_chart_instrument') {
+                if (dhan) {
+                    const inst = payload.payload;
+                    let hist = await dhan.getHistory(inst.id, INDEX_CONFIG[currentConfig.indexId].seg, inst.type, currentConfig.timeframe);
+                    hist = hist || [];
+                    ws.send(JSON.stringify({ type: 'history', data: hist, target: 'chart', name: inst.name }));
+                }
             }
- else if (payload.type === 'expiry_change') {
-                currentConfig.expiry = payload.expiry;
-            }
-        } catch (e) {}
+        } catch (e: any) {
+            debug_log("WS msg error: " + (e.message || e));
+        }
     });
 
     ws.on("close", () => {

@@ -9,7 +9,6 @@ import { OrdersModule, type Order } from './components/OrdersModule';
 import { ProcessTerminal, type LogEntry } from './components/ProcessTerminal';
 import { useSandboxEngine } from './hooks/useSandboxEngine';
 import { Shield, Activity, Layout, PieChart, Settings, Zap, Calendar, AlertTriangle, Maximize2, Minimize2, Sun, Moon, Clock, Wallet } from 'lucide-react';
-import { localAppServer } from './services/LocalServer';
 
 const INDICES = [
   { name: 'NIFTY 50', id: '13' },
@@ -100,7 +99,9 @@ function App() {
     setModuleConfig(prev => {
       const next = { ...prev, [key]: val };
       localStorage.setItem('module_config', JSON.stringify(next));
-      localAppServer.handleMessage({ type: 'module_config', payload: next });
+      if (ws.current?.readyState === WebSocket.OPEN) {
+          ws.current.send(JSON.stringify({ type: 'module_config', payload: next }));
+      }
       return next;
     });
   }, []);
@@ -242,7 +243,9 @@ function App() {
   useEffect(() => {
         const activePosArr = (paperTrading ? sandbox.positions : positions).filter((p: any) => p.qty > 0);
         const hasOrders = activePosArr.length > 0;
-        localAppServer.handleMessage({ type: 'has_active_orders', payload: hasOrders });
+        if (ws.current?.readyState === WebSocket.OPEN) {
+            ws.current.send(JSON.stringify({ type: 'has_active_orders', payload: hasOrders }));
+        }
         // Send security IDs for fast LTP polling (live mode only)
         if (!paperTrading && hasOrders) {
             const idMap: Record<string, number[]> = {};
@@ -252,8 +255,8 @@ function App() {
                     idMap[p.segment].push(Number(p.securityId));
                 }
             });
-            if (Object.keys(idMap).length > 0) {
-                localAppServer.handleMessage({ type: 'active_position_ids', payload: idMap });
+            if (Object.keys(idMap).length > 0 && ws.current?.readyState === WebSocket.OPEN) {
+                ws.current.send(JSON.stringify({ type: 'active_position_ids', payload: idMap }));
             }
         }
   }, [positions, sandbox.positions, paperTrading]);
@@ -265,7 +268,9 @@ function App() {
     }
     addLog('[BROKER] FETCHING LIVE FUND LIMITS...', 'info');
     try {
-        const funds = await localAppServer.getFunds(mstockKeys?.user_id || '');
+        const res = await fetch('/api/mstock/funds', { headers: { 'x-user-id': mstockKeys?.user_id || '' } });
+        const data = await res.json();
+        const funds = data.status === 'success' ? data.funds : 0;
         setCapital(funds);
         addLog(`[BROKER] LIMITS UPDATED: ₹${Number(funds).toLocaleString()}`, 'success');
     } catch (e) {
@@ -307,7 +312,12 @@ function App() {
     const entryType = orderType === 'LMT' ? 'SL' : 'MARKET';
     notify(`INITIATING BRACKET BUY ${symbol} (x${numLots})...`, 'info');
     try {
-        const entryRes = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol, qty: totalQty, side: 'BUY', price: orderType === 'LMT' ? effectivePrice + 0.1 : 0, trigger_price: orderType === 'LMT' ? effectivePrice : 0, order_type: entryType });
+        const res = await fetch('/api/mstock/place-order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-user-id': mstockKeys?.user_id || '' },
+            body: JSON.stringify({ symbol, qty: totalQty, side: 'BUY', price: orderType === 'LMT' ? effectivePrice + 0.1 : 0, trigger_price: orderType === 'LMT' ? effectivePrice : 0, order_type: entryType })
+        });
+        const entryRes = await res.json();
         if (entryRes.status === 'success') {
             const entryOrderId = entryRes.data?.order_id || orderId;
             notify(`ENTRY PLACED: ${entryOrderId}`, 'success');
@@ -315,7 +325,12 @@ function App() {
             // Place SL leg (SL-M = Stop-Loss Market: trigger_price only, fills at market)
             const placeSL = async (): Promise<string | null> => {
                 await new Promise(r => setTimeout(r, 800));
-                const slData = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol, qty: totalQty, side: 'SELL', price: 0, trigger_price: effectiveSL, order_type: 'SL-M' });
+                const res = await fetch('/api/mstock/place-order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-user-id': mstockKeys?.user_id || '' },
+                    body: JSON.stringify({ symbol, qty: totalQty, side: 'SELL', price: 0, trigger_price: effectiveSL, order_type: 'SL-M' })
+                });
+                const slData = await res.json();
                 if (slData.status === 'success') {
                     notify(`AUTO-SL ACTIVE: ₹${effectiveSL.toFixed(1)} (SL-M)`, 'success');
                     return slData.data?.order_id || null;
@@ -327,7 +342,12 @@ function App() {
             // Place TGT leg (LIMIT order)
             const placeTGT = async (): Promise<string | null> => {
                 await new Promise(r => setTimeout(r, 1500));
-                const tgtData = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol, qty: totalQty, side: 'SELL', price: effectiveTarget, order_type: 'LIMIT' });
+                const res = await fetch('/api/mstock/place-order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-user-id': mstockKeys?.user_id || '' },
+                    body: JSON.stringify({ symbol, qty: totalQty, side: 'SELL', price: effectiveTarget, order_type: 'LIMIT' })
+                });
+                const tgtData = await res.json();
                 if (tgtData.status === 'success') {
                     notify(`AUTO-TGT ACTIVE: ₹${effectiveTarget.toFixed(1)}`, 'success');
                     return tgtData.data?.order_id || null;
@@ -340,7 +360,11 @@ function App() {
             const [slOrderId, tgtOrderId] = await Promise.all([placeSL(), placeTGT()]);
             if (slOrderId && tgtOrderId) {
                 // Register the OCO pair with the backend monitor
-                localAppServer.registerOco(mstockKeys?.user_id || '', { entry_order_id: entryOrderId, sl_order_id: slOrderId, tgt_order_id: tgtOrderId, symbol, qty: totalQty });
+                fetch('/api/mstock/register-oco', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-user-id': mstockKeys?.user_id || '' },
+                    body: JSON.stringify({ entry_order_id: entryOrderId, sl_order_id: slOrderId, tgt_order_id: tgtOrderId, symbol, qty: totalQty })
+                });
                 notify('OCO REGISTERED — app will auto-cancel other leg on fill', 'info');
             }
 
@@ -362,7 +386,12 @@ function App() {
     if (!pos) return;
     notify(`EXITING POSITION ${pos.symbol}...`, 'info');
     try {
-        const orderRes = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol: pos.symbol, qty: pos.qty, side: 'SELL', price: 0, order_type: 'MARKET' });
+        const res = await fetch('/api/mstock/place-order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-user-id': mstockKeys?.user_id || '' },
+            body: JSON.stringify({ symbol: pos.symbol, qty: pos.qty, side: 'SELL', price: 0, order_type: 'MARKET' })
+        });
+        const orderRes = await res.json();
         if (orderRes.status === 'success') {
             const strikeData = data.chain.find((r: any) => r.Strike === pos.strike);
             const exitPrice = pos.side === 'CE' ? (strikeData?.Call_LTP || pos.entryPrice) : (strikeData?.Put_LTP || pos.entryPrice);
@@ -448,73 +477,110 @@ function App() {
   const ws = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    const handleMessage = (message: any) => {
-        try {
-            if (message.type === 'error') {
-                notify(message.message, 'error');
-                if (message.message.toLowerCase().includes('credentials') || message.message.toLowerCase().includes('failed to connect')) {
-                    setDhanConnected(false);
-                    addLog('Fatal Auth Error: Auto-reconnect aborted', 'error');
-                }
+    let reconnectTimer: NodeJS.Timeout;
+    const connectWs = () => {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const newWs = new WebSocket(wsUrl);
+
+        newWs.onopen = () => {
+            if (dhanKeys?.client_id && dhanKeys?.access_token) {
+                newWs.send(JSON.stringify({ type: 'auth', payload: dhanKeys }));
+                
+                try {
+                    const savedConfigStr = localStorage.getItem('module_config');
+                    let startConfig = { optionChain: true, gexProfile: true, combinedGex: false, scalper: true, watchlist: true };
+                    if (savedConfigStr) startConfig = JSON.parse(savedConfigStr);
+                    newWs.send(JSON.stringify({ type: 'module_config', payload: startConfig }));
+                } catch(e) {}
+                
+                // Send initial state to get data loading immediately
+                newWs.send(JSON.stringify({ type: 'timeframe_change', timeframe: selectedTimeframe }));
+                newWs.send(JSON.stringify({ type: 'index_change', id: selectedIndex }));
             }
-            else if (message.type === 'oco_filled') {
-                const { entry_id, filled_leg, symbol, qty } = message.data;
-                const icon = filled_leg === 'TGT' ? '🎯' : '🛑';
-                addLog(`${icon} OCO ${filled_leg} FILLED: ${symbol} x${qty}`, filled_leg === 'TGT' ? 'success' : 'warn');
-                notify(`${icon} ${filled_leg} HIT — ${symbol} position closed by OCO`, filled_leg === 'TGT' ? 'success' : 'warn');
-                setPositions(prev => {
-                    const pos = prev.find((p: any) => p.id === entry_id);
-                    if (pos) {
-                        const exitPrice = filled_leg === 'TGT' ? (pos.targetPrice || pos.entryPrice) : (pos.slPrice || pos.entryPrice);
-                        const pnl = (exitPrice - pos.entryPrice) * pos.qty;
-                        setBookedPnl(bpnl => bpnl + pnl);
-                        setOrders(ord => [{ id: `OCO_${entry_id}`, action: 'SELL' as const, side: pos.side, strike: pos.strike, type: filled_leg, price: exitPrice, qty: pos.qty, status: 'EXECUTED' as const, timestamp: new Date().toLocaleTimeString() }, ...ord]);
+        };
+
+        newWs.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                if (message.type === 'error') {
+                    notify(message.message, 'error');
+                    if (message.message.toLowerCase().includes('credentials') || message.message.toLowerCase().includes('failed to connect')) {
+                        setDhanConnected(false);
+                        addLog('Fatal Auth Error: Auto-reconnect aborted', 'error');
                     }
-                    return prev.filter((p: any) => p.id !== entry_id);
-                });
-            }
-            else if (message.type === 'ltp_update') {
-                setLtpMap(prev => ({ ...prev, ...message.data }));
-            }
-            else if (message.type === 'history') {
-              if (message.target === 'index' || message.target === 'chart') setIndexChartData(message.data);
-            } else if (message.type === 'expiries') {
-              setExpiries(Array.isArray(message.data) ? message.data : []);
-              if (Array.isArray(message.data) && message.data.length > 0) setSelectedExpiry(message.data[0]);
-              setDhanConnected(true);
-              if (dhanKeys?.client_id && dhanKeys?.access_token) {
-                localStorage.setItem('dhan_keys', JSON.stringify(dhanKeys));
-              }
-            } else if (message.type === 'indices_spot') {
-              if (Array.isArray(message.data)) setIndicesSpot(message.data.filter((i: any) => i !== null));
-            } else if (message.type === 'data') {
-              if (message.ohlc) setLiveOhlc(message.ohlc);
-              setData((prev: any) => ({
-                  ...prev,
-                  ...message,
-                  spot: message.spot > 0 ? message.spot : prev.spot,
-                  market_on: !!message.market_on,
-                  market_status: message.market_status || 'closed',
-                  chain: Array.isArray(message.chain) && message.chain.length > 0 ? message.chain : prev.chain,
-                  gex: Array.isArray(message.gex) && message.gex.length > 0 ? message.gex : prev.gex,
-              }));
-            }
-        } catch (e: any) { addLog('LocalServer Error: ' + e.message, 'warn'); }
+                }
+                else if (message.type === 'warning') {
+                    notify(message.message, 'warn');
+                    addLog(message.message, 'warn');
+                }
+                else if (message.type === 'oco_filled') {
+                    const { entry_id, filled_leg, symbol, qty } = message.data;
+                    const icon = filled_leg === 'TGT' ? '🎯' : '🛑';
+                    addLog(`${icon} OCO ${filled_leg} FILLED: ${symbol} x${qty}`, filled_leg === 'TGT' ? 'success' : 'warn');
+                    notify(`${icon} ${filled_leg} HIT — ${symbol} position closed by OCO`, filled_leg === 'TGT' ? 'success' : 'warn');
+                    setPositions(prev => {
+                        const pos = prev.find((p: any) => p.id === entry_id);
+                        if (pos) {
+                            const exitPrice = filled_leg === 'TGT' ? (pos.targetPrice || pos.entryPrice) : (pos.slPrice || pos.entryPrice);
+                            const pnl = (exitPrice - pos.entryPrice) * pos.qty;
+                            setBookedPnl(bpnl => bpnl + pnl);
+                            setOrders(ord => [{ id: `OCO_${entry_id}`, action: 'SELL' as const, side: pos.side, strike: pos.strike, type: filled_leg, price: exitPrice, qty: pos.qty, status: 'EXECUTED' as const, timestamp: new Date().toLocaleTimeString() }, ...ord]);
+                        }
+                        return prev.filter((p: any) => p.id !== entry_id);
+                    });
+                }
+                else if (message.type === 'ltp_update') {
+                    setLtpMap(prev => ({ ...prev, ...message.data }));
+                }
+                else if (message.type === 'history') {
+                    if (message.target === 'index' || message.target === 'chart') setIndexChartData(message.data);
+                } else if (message.type === 'expiries') {
+                    setExpiries(Array.isArray(message.data) ? message.data : []);
+                    if (Array.isArray(message.data) && message.data.length > 0) setSelectedExpiry(message.data[0]);
+                    setDhanConnected(true);
+                    if (dhanKeys?.client_id && dhanKeys?.access_token) {
+                        localStorage.setItem('dhan_keys', JSON.stringify(dhanKeys));
+                    }
+                } else if (message.type === 'indices_spot') {
+                    if (Array.isArray(message.data)) setIndicesSpot(message.data.filter((i: any) => i !== null));
+                } else if (message.type === 'data') {
+                    if (message.ohlc) setLiveOhlc(message.ohlc);
+                    setData((prev: any) => ({
+                        ...prev,
+                        ...message,
+                        spot: message.spot > 0 ? message.spot : prev.spot,
+                        market_on: !!message.market_on,
+                        market_status: message.market_status || 'closed',
+                        chain: Array.isArray(message.chain) && message.chain.length > 0 ? message.chain : prev.chain,
+                        gex: Array.isArray(message.gex) && message.gex.length > 0 ? message.gex : prev.gex,
+                        agg_gex: Array.isArray(message.agg_gex) && message.agg_gex.length > 0 ? message.agg_gex : prev.agg_gex,
+                    }));
+                }
+            } catch (e: any) { addLog('LocalServer Error: ' + e.message, 'warn'); }
+        };
+
+        newWs.onclose = () => {
+            reconnectTimer = setTimeout(connectWs, 5000);
+        };
+
+        ws.current = newWs;
     };
 
-    const unsubscribe = localAppServer.onMessage(handleMessage);
-    
-    if (dhanKeys?.client_id && dhanKeys?.access_token) {
-        localAppServer.handleMessage({ type: 'auth', payload: dhanKeys });
-    }
+    connectWs();
 
-    return () => unsubscribe();
+    return () => {
+        clearTimeout(reconnectTimer);
+        ws.current?.close();
+    };
   }, [dhanKeys, addLog, notify]);
 
   const handleExpiryChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const expiry = e.target.value;
     setSelectedExpiry(expiry);
-    localAppServer.handleMessage({ type: 'select_expiry', payload: expiry });
+    if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'select_expiry', payload: expiry }));
+    }
   };
 
   const handleIndexChange = (indexId: string) => {
@@ -522,23 +588,31 @@ function App() {
     setIndexChartData([]); 
     const idxName = INDICES.find(i => i.id === indexId)?.name || 'INDEX';
     setChartName(idxName);
-    localAppServer.handleMessage({ type: 'index_change', id: indexId });
+    if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'index_change', id: indexId }));
+    }
   };
 
   const handleSelectInstrument = (inst: { id: string, name: string, type: 'INDEX' | 'OPT' }) => {
     setChartName(inst.name);
     setIndexChartData([]); 
-    localAppServer.handleMessage({ type: 'select_chart_instrument', payload: inst });
+    if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'select_chart_instrument', payload: inst }));
+    }
   };
 
   const handleTimeframeChange = (tf: number | string) => {
     setSelectedTimeframe(tf);
-    localAppServer.handleMessage({ type: 'timeframe_change', timeframe: tf });
+    if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'timeframe_change', timeframe: tf }));
+    }
   };
 
   const handleGexStrikesChange = (num: number) => {
     setGexStrikes(num);
-    localAppServer.handleMessage({ type: 'select_gex_strikes', payload: num });
+    if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'select_gex_strikes', payload: num }));
+    }
   };
 
   const handleSaveSettings = async (dhan: any, mstock: any) => {
@@ -555,7 +629,9 @@ function App() {
 
   const handleRefreshPositions = async () => {
     try {
-        const remotePositions = await localAppServer.getPositions(mstockKeys?.user_id || '');
+        const res = await fetch('/api/mstock/positions', { headers: { 'x-user-id': mstockKeys?.user_id || '' } });
+        const data = await res.json();
+        const remotePositions = data.status === 'success' ? data.positions : [];
         notify(`SYNC COMPLETE: Found ${Array.isArray(remotePositions) ? remotePositions.length : 0} external positions`, 'success');
     } catch (e: any) { notify(`SYNC FAILED: ${e.message}`, 'error'); }
   };
@@ -609,7 +685,7 @@ function App() {
           --trading-border: ${theme === 'dark' ? '#30363d' : '#e2e8f0'};
           --trading-text: ${theme === 'dark' ? '#c9d1d9' : '#1e293b'};
           --trading-muted: ${theme === 'dark' ? '#8b949e' : '#64748b'};
-          --trading-accent: #38bdf8;
+          --trading-accent: #3b82f6;
           --trading-success: #238636;
           --trading-danger: #da3633;
           color-scheme: ${theme};
@@ -622,7 +698,15 @@ function App() {
             <div className="bg-trading-accent p-1.5 rounded-lg shadow-lg shadow-trading-accent/20">
               <Zap size={22} className="text-white fill-current" />
             </div>
-            <h1 className={`text-lg font-black tracking-tighter ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>TERMINAL</h1>
+            <select 
+              value={selectedIndex}
+              onChange={(e) => handleIndexChange(e.target.value)}
+              className={`text-lg font-black tracking-tighter bg-transparent border-none outline-none cursor-pointer p-0 ${theme === 'dark' ? 'text-white' : 'text-slate-900'} [&>option]:text-slate-900`}
+            >
+              {INDICES.map(idx => (
+                <option key={idx.id} value={idx.id}>{idx.name}</option>
+              ))}
+            </select>
             <div className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-[8px] font-black uppercase tracking-widest ${data.market_status === 'open' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-500' : data.market_status === 'pre-market' ? 'bg-amber-500/10 border-amber-500/30 text-amber-500' : 'bg-rose-500/10 border-rose-500/30 text-rose-500'}`}>
                 <div className={`h-1.5 w-1.5 rounded-full ${data.market_status === 'open' ? 'bg-emerald-500 animate-pulse' : data.market_status === 'pre-market' ? 'bg-amber-500 animate-pulse' : 'bg-rose-500'}`}></div>
                 <span className="hidden sm:inline">{data.market_status === 'open' ? 'Live' : data.market_status === 'pre-market' ? 'Pre-market' : 'Closed'}</span>

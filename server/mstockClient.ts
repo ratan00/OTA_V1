@@ -131,7 +131,7 @@ export class MStockClient {
     async getFunds() {
         if (!this.access_token) return 0;
         try {
-            const response = await axios.get(`${this.baseUrl}/user/margins`, { headers: this.headers });
+            const response = await axios.get(`${this.baseUrl}/funds/limit`, { headers: this.headers });
             if (response.data?.status === 'success') {
                 return parseFloat(response.data.data?.equity?.available?.cash || 0);
             }

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType, CandlestickSeries, HistogramSeries, LineSeries, type IChartApi, type ISeriesApi, type SeriesMarker } from 'lightweight-charts';
+import { createChart, ColorType, CandlestickSeries, HistogramSeries, LineSeries, createSeriesMarkers, type IChartApi, type ISeriesApi, type SeriesMarker } from 'lightweight-charts';
 import { RefreshCw } from 'lucide-react';
 
 interface TradingChartProps {
@@ -138,6 +138,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
     const ema9SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
     const ema21SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+    const seriesMarkersRef = useRef<any>(null);
     
     // Refs for Gamma Levels
     const callWallLineRef = useRef<any>(null);
@@ -268,6 +269,9 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         volumeSeriesRef.current = volumeSeries;
         ema9SeriesRef.current = ema9Series;
         ema21SeriesRef.current = ema21Series;
+        if (!seriesMarkersRef.current) {
+            seriesMarkersRef.current = createSeriesMarkers(candleSeries);
+        }
 
         chart.subscribeCrosshairMove((param) => {
             if (!param.time || param.point === undefined || !param.seriesData.get(candleSeries)) {
@@ -299,6 +303,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         return () => {
             ro.disconnect();
             window.removeEventListener('resize', handleResize);
+            seriesMarkersRef.current = null;
             chart.remove();
         };
     }, [theme, title, timeframe]);
@@ -310,7 +315,8 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         // Filter intraday bars to IST 09:15–15:30 to kill off-hours ghost candles.
         // Skip for '1D' — daily bars have midnight timestamps outside this window.
         const IST_OFFSET = 19800; // 5h30m in seconds
-        const inTradingHours = (ts: number) => {
+        const inTradingHours = (timeVal: number | string) => {
+            const ts = typeof timeVal === 'string' ? new Date(timeVal).getTime() / 1000 : (timeVal > 2000000000 ? timeVal / 1000 : timeVal);
             const istSeconds = (ts + IST_OFFSET) % 86400; // seconds since midnight IST
             const minOfDay = Math.floor(istSeconds / 60);  // minute of day in IST
             return minOfDay >= 555 && minOfDay <= 930;      // 09:15–15:30
@@ -336,13 +342,13 @@ export const TradingChart: React.FC<TradingChartProps> = ({
             const start = Math.max(0, i - vLen);
             const slice = vols.slice(start, i + 1);
             const vSMA = slice.reduce((a, b) => a + b, 0) / slice.length;
-            const isBull = c.close > c.open;
+            const isBull = c.close >= c.open;
             
             let color = isBull ? upColor : downColor;
             if (c.volume > vSMA * 1.618) {
-                color = isBull ? '#006400' : '#910000';
+                color = isBull ? '#006400' : '#8B0000'; // darker red for high vol bear
             } else if (c.volume < vSMA * 0.618) {
-                color = isBull ? '#7FFFD4' : '#FF9800';
+                color = isBull ? '#7FFFD4' : '#FFA500';
             }
             
             return {
@@ -353,7 +359,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
             };
         });
 
-        const volumes = data.map(d => ({
+        const volumes = candles_raw.map(d => ({
             time: d.time,
             value: d.volume || 0,
             color: d.close >= d.open ? 'rgba(8, 153, 129, 0.3)' : 'rgba(242, 54, 69, 0.3)',
@@ -369,9 +375,9 @@ export const TradingChart: React.FC<TradingChartProps> = ({
 
         if (showUtBot) {
             const markers = calculateUtBot(candles_raw);
-            candleSeriesRef.current.setMarkers(markers);
+            if (seriesMarkersRef.current) seriesMarkersRef.current.setMarkers(markers);
         } else {
-            candleSeriesRef.current.setMarkers([]);
+            if (seriesMarkersRef.current) seriesMarkersRef.current.setMarkers([]);
         }
 
         const last = data[data.length - 1];
