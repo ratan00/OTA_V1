@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --color-trading-bg: var(--trading-bg);
+  --color-trading-card: var(--trading-card);
+  --color-trading-border: var(--trading-border);
+  --color-trading-text: var(--trading-text);
+  --color-trading-muted: var(--trading-muted);
+  --color-trading-accent: var(--trading-accent);
+  --color-trading-success: var(--trading-success);
+  --color-trading-danger: var(--trading-danger);
+  
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+:root {
+  --trading-bg: #0d1117;
+  --trading-card: #161b22;
+  --trading-border: #30363d;
+  --trading-text: #c9d1d9;
+  --trading-muted: #8b949e;
+  --trading-accent: #38bdf8;
+  --trading-success: #238636;
+  --trading-danger: #da3633;
+}
+
+body {
+  @apply bg-trading-bg text-trading-text font-sans overflow-x-hidden;
+  margin: 0;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Custom scrollbar for a pro look */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-[#0d1117];
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-[#30363d] rounded-full hover:bg-[#484f58];
+}
+
+/* TradingView-like grid backgrounds */
+.trading-grid {
+  background-image: radial-gradient(circle, #30363d 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Smooth transitions */
+.transition-trading {
+  @apply transition-all duration-200 ease-in-out;
+}
+
+/* Glassmorphism */
+.glass {
+  @apply bg-[#161b22]/80 backdrop-blur-md;
+}
+
+/* Hide scrollbar but keep functionality */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

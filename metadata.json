@@ -1,0 +1,6 @@
+{
+  "name": "Option Trading Terminal",
+  "description": "An advanced terminal for option trading with real-time analytics, GEX charts, and synthetic OCO orders.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
