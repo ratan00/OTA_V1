@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { X, Key, Shield, User, Link2, CheckCircle2, AlertCircle, RefreshCw, Clock, Database, Download } from 'lucide-react';
 import { decodeDhanToken } from '../utils/tokenUtils';
+import { localAppServer } from '../services/LocalServer';
 
 interface SettingsModalProps {
   onSave: (dhan: any, mstock: any) => void;
@@ -52,8 +53,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const handleClearCache = useCallback(async () => {
     setClearingCache(true);
     try {
-      const res = await fetch('/api/cache/clear');
-      const data = await res.json();
+      const res = await localAppServer.clearCache();
+      const data = res;
       if (data.status === 'success') {
         notify('Cache cleared — stream will fetch fresh data automatically.', 'success');
       } else {
@@ -70,7 +71,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setRefreshingData(true);
     try {
       // Clear cache first, then signal WS to re-fetch immediately
-      await fetch('/api/cache/clear');
+      await localAppServer.clearCache();
       notify('Market data refresh triggered — stream will reload fresh data.', 'success');
     } catch (e: any) {
       notify(`Refresh error: ${e.message}`, 'error');
@@ -86,12 +87,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
     setLoading(true);
     try {
-        const res = await fetch('/api/mstock/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: mstock.user_id, password: mstock.password, api_key: mstock.api_key })
-        });
-        const data = await res.json();
+        const data = await localAppServer.mstockLogin(mstock.user_id, mstock.password, mstock.api_key);
         if (data.status === 'success') {
             notify('MStock Login Step 1 Success. Enter TOTP.', 'success');
             setStep('TOTP');
@@ -112,12 +108,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
     setLoading(true);
     try {
-        const res = await fetch('/api/mstock/verify-totp', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: mstock.user_id, api_key: mstock.api_key, totp })
-        });
-        const data = await res.json();
+        const data = await localAppServer.mstockVerifyTotp(mstock.user_id, mstock.api_key, totp);
         if (data.status === 'success') {
             notify('MStock Authentication Complete', 'success');
             onRefreshFunds();
@@ -283,12 +274,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       onClick={async () => {
                         setLoading(true);
                         try {
-                          const res = await fetch('/api/dhan/renew-token', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ client_id: dhan.client_id, access_token: dhan.access_token })
-                          });
-                          const data = await res.json();
+                          const data = await localAppServer.renewDhanToken(dhan.client_id, dhan.access_token) as any;
                           if (data.status === 'success' && data.data) {
                             const newToken = data.data.accessToken || data.data.access_token || data.data.token || (typeof data.data === 'string' ? data.data : null);
                             if (newToken) {

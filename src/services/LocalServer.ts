@@ -59,6 +59,16 @@ export class LocalServer {
         this.listeners.forEach(l => l(event));
     }
 
+    async renewDhanToken(client_id: string, access_token: string) {
+        return { status: "success", message: "Token renewal is handled via direct login in this version" };
+    }
+
+    async clearCache() {
+        this.cachedChain = [];
+        this.lastSpotMap.clear();
+        return { status: "success", message: "Cache cleared" };
+    }
+
     async mstockLogin(user_id: string, password?: string, api_key?: string) {
         let client = this.mstockClients.get(user_id);
         if (!client) {
