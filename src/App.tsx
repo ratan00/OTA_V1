@@ -9,6 +9,7 @@ import { OrdersModule, type Order } from './components/OrdersModule';
 import { ProcessTerminal, type LogEntry } from './components/ProcessTerminal';
 import { useSandboxEngine } from './hooks/useSandboxEngine';
 import { Shield, Activity, Layout, PieChart, Settings, Zap, Calendar, AlertTriangle, Maximize2, Minimize2, Sun, Moon, Clock, Wallet } from 'lucide-react';
+import { localAppServer } from './services/LocalServer';
 
 const INDICES = [
   { name: 'NIFTY 50', id: '13' },
@@ -99,10 +100,7 @@ function App() {
     setModuleConfig(prev => {
       const next = { ...prev, [key]: val };
       localStorage.setItem('module_config', JSON.stringify(next));
-      // Notify backend so it can skip computation for disabled modules
-      if (ws.current?.readyState === WebSocket.OPEN) {
-        ws.current.send(JSON.stringify({ type: 'module_config', payload: next }));
-      }
+      localAppServer.handleMessage({ type: 'module_config', payload: next });
       return next;
     });
   }, []);
@@ -242,10 +240,9 @@ function App() {
 
   // Send active position security IDs to backend for fast 1s LTP polling
   useEffect(() => {
-    if (ws.current?.readyState === WebSocket.OPEN) {
         const activePosArr = (paperTrading ? sandbox.positions : positions).filter((p: any) => p.qty > 0);
         const hasOrders = activePosArr.length > 0;
-        ws.current.send(JSON.stringify({ type: 'has_active_orders', payload: hasOrders }));
+        localAppServer.handleMessage({ type: 'has_active_orders', payload: hasOrders });
         // Send security IDs for fast LTP polling (live mode only)
         if (!paperTrading && hasOrders) {
             const idMap: Record<string, number[]> = {};
@@ -256,10 +253,9 @@ function App() {
                 }
             });
             if (Object.keys(idMap).length > 0) {
-                ws.current.send(JSON.stringify({ type: 'active_position_ids', payload: idMap }));
+                localAppServer.handleMessage({ type: 'active_position_ids', payload: idMap });
             }
         }
-    }
   }, [positions, sandbox.positions, paperTrading]);
 
   const handleGetFunds = useCallback(async () => {
@@ -269,18 +265,13 @@ function App() {
     }
     addLog('[BROKER] FETCHING LIVE FUND LIMITS...', 'info');
     try {
-        const res = await fetch('/api/mstock/funds');
-        const d = await res.json();
-        if (d.status === 'success') {
-            setCapital(d.funds);
-            addLog(`[BROKER] LIMITS UPDATED: ₹${Number(d.funds).toLocaleString()}`, 'success');
-        } else {
-            addLog('[BROKER] FAILED TO FETCH FUNDS', 'error');
-        }
+        const funds = await localAppServer.getFunds(mstockKeys?.user_id || '');
+        setCapital(funds);
+        addLog(`[BROKER] LIMITS UPDATED: ₹${Number(funds).toLocaleString()}`, 'success');
     } catch (e) {
         addLog('[BROKER] FUND FETCH ERROR', 'error');
     }
-  }, [addLog, mstockConnected]);
+  }, [addLog, mstockConnected, mstockKeys]);
 
   const handleScalperTrade = useCallback(async (side: 'CE' | 'PE', strike: number, price: number, sl: number, target: number, orderType: 'MKT' | 'LMT', numLots: number = 1) => {
     let targetStrike = strike;
@@ -316,13 +307,7 @@ function App() {
     const entryType = orderType === 'LMT' ? 'SL' : 'MARKET';
     notify(`INITIATING BRACKET BUY ${symbol} (x${numLots})...`, 'info');
     try {
-        const res = await fetch('/api/mstock/place-order', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ symbol, qty: totalQty, side: 'BUY', price: orderType === 'LMT' ? effectivePrice + 0.1 : 0, trigger_price: orderType === 'LMT' ? effectivePrice : 0, order_type: entryType })
-        });
-        if (!res.ok) { notify(`ORDER HTTP ERROR ${res.status}`, 'error'); return; }
-        const entryRes = await res.json();
+        const entryRes = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol, qty: totalQty, side: 'BUY', price: orderType === 'LMT' ? effectivePrice + 0.1 : 0, trigger_price: orderType === 'LMT' ? effectivePrice : 0, order_type: entryType });
         if (entryRes.status === 'success') {
             const entryOrderId = entryRes.data?.order_id || orderId;
             notify(`ENTRY PLACED: ${entryOrderId}`, 'success');
@@ -330,12 +315,7 @@ function App() {
             // Place SL leg (SL-M = Stop-Loss Market: trigger_price only, fills at market)
             const placeSL = async (): Promise<string | null> => {
                 await new Promise(r => setTimeout(r, 800));
-                const slRes = await fetch('/api/mstock/place-order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ symbol, qty: totalQty, side: 'SELL', price: 0, trigger_price: effectiveSL, order_type: 'SL-M' })
-                });
-                const slData = await slRes.json();
+                const slData = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol, qty: totalQty, side: 'SELL', price: 0, trigger_price: effectiveSL, order_type: 'SL-M' });
                 if (slData.status === 'success') {
                     notify(`AUTO-SL ACTIVE: ₹${effectiveSL.toFixed(1)} (SL-M)`, 'success');
                     return slData.data?.order_id || null;
@@ -347,12 +327,7 @@ function App() {
             // Place TGT leg (LIMIT order)
             const placeTGT = async (): Promise<string | null> => {
                 await new Promise(r => setTimeout(r, 1500));
-                const tgtRes = await fetch('/api/mstock/place-order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ symbol, qty: totalQty, side: 'SELL', price: effectiveTarget, order_type: 'LIMIT' })
-                });
-                const tgtData = await tgtRes.json();
+                const tgtData = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol, qty: totalQty, side: 'SELL', price: effectiveTarget, order_type: 'LIMIT' });
                 if (tgtData.status === 'success') {
                     notify(`AUTO-TGT ACTIVE: ₹${effectiveTarget.toFixed(1)}`, 'success');
                     return tgtData.data?.order_id || null;
@@ -365,13 +340,8 @@ function App() {
             const [slOrderId, tgtOrderId] = await Promise.all([placeSL(), placeTGT()]);
             if (slOrderId && tgtOrderId) {
                 // Register the OCO pair with the backend monitor
-                fetch('/api/mstock/register-oco', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ entry_order_id: entryOrderId, sl_order_id: slOrderId, tgt_order_id: tgtOrderId, symbol, qty: totalQty })
-                }).then(r => r.json()).then(r => {
-                    if (r.status === 'success') notify('OCO REGISTERED — backend will auto-cancel other leg on fill', 'info');
-                }).catch(() => {});
+                localAppServer.registerOco(mstockKeys?.user_id || '', { entry_order_id: entryOrderId, sl_order_id: slOrderId, tgt_order_id: tgtOrderId, symbol, qty: totalQty });
+                notify('OCO REGISTERED — app will auto-cancel other leg on fill', 'info');
             }
 
             const newPos = { id: entryOrderId, symbol, side, strike: targetStrike, entryPrice: effectivePrice, slPrice: effectiveSL, targetPrice: effectiveTarget, qty: totalQty, orderType, timestamp: new Date().toLocaleTimeString() };
@@ -392,13 +362,7 @@ function App() {
     if (!pos) return;
     notify(`EXITING POSITION ${pos.symbol}...`, 'info');
     try {
-        const res = await fetch('/api/mstock/place-order', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ symbol: pos.symbol, qty: pos.qty, side: 'SELL', price: 0, order_type: 'MARKET' })
-        });
-        if (!res.ok) { notify(`EXIT HTTP ERROR ${res.status}`, 'error'); return; }
-        const orderRes = await res.json();
+        const orderRes = await localAppServer.placeOrder(mstockKeys?.user_id || '', { symbol: pos.symbol, qty: pos.qty, side: 'SELL', price: 0, order_type: 'MARKET' });
         if (orderRes.status === 'success') {
             const strikeData = data.chain.find((r: any) => r.Strike === pos.strike);
             const exitPrice = pos.side === 'CE' ? (strikeData?.Call_LTP || pos.entryPrice) : (strikeData?.Put_LTP || pos.entryPrice);
@@ -484,103 +448,73 @@ function App() {
   const ws = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    let currentWs: WebSocket | null = null;
-    let currentReconnectTimeoutId: number | null = null;
-    const initiateConnection = () => {
-      if (currentWs) { currentWs.onclose = null; currentWs.close(); }
-      if (currentReconnectTimeoutId) window.clearTimeout(currentReconnectTimeoutId);
-      addLog('Initiating WebSocket connection...', 'info');
-      try {
-          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-          const socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
-          currentWs = socket;
-          ws.current = socket;
-          socket.onopen = () => {
-            notify('WebSocket connected', 'success');
-            if (dhanKeys?.client_id && dhanKeys?.access_token) {
-              socket.send(JSON.stringify({ type: 'auth', payload: dhanKeys }));
-            }
-          };
-          socket.onmessage = (event) => {
-            try {
-              const message = JSON.parse(event.data);
-              if (message.type === 'error') {
-                  notify(message.message, 'error');
-                  if (message.message.toLowerCase().includes('credentials') || message.message.toLowerCase().includes('failed to connect')) {
-                      // Fatal auth error, prevent auto-reconnect
-                      if (currentWs) {
-                          currentWs.onclose = null;
-                          currentWs.close();
-                      }
-                      if (currentReconnectTimeoutId) window.clearTimeout(currentReconnectTimeoutId);
-                      setDhanConnected(false);
-                      addLog('Fatal Auth Error: Auto-reconnect aborted', 'error');
-                  }
-              }
-              else if (message.type === 'oco_filled') {
-                  // Backend OCO monitor: one leg (SL or TGT) filled — position auto-exited
-                  const { entry_id, filled_leg, symbol, qty } = message.data;
-                  const icon = filled_leg === 'TGT' ? '🎯' : '🛑';
-                  addLog(`${icon} OCO ${filled_leg} FILLED: ${symbol} x${qty}`, filled_leg === 'TGT' ? 'success' : 'warn');
-                  notify(`${icon} ${filled_leg} HIT — ${symbol} position closed by OCO`, filled_leg === 'TGT' ? 'success' : 'warn');
-                  // Remove the position and update booked PnL
-                  setPositions(prev => {
-                      const pos = prev.find((p: any) => p.id === entry_id);
-                      if (pos) {
-                          const exitPrice = filled_leg === 'TGT' ? (pos.targetPrice || pos.entryPrice) : (pos.slPrice || pos.entryPrice);
-                          const pnl = (exitPrice - pos.entryPrice) * pos.qty;
-                          setBookedPnl(bpnl => bpnl + pnl);
-                          setOrders(ord => [{ id: `OCO_${entry_id}`, action: 'SELL' as const, side: pos.side, strike: pos.strike, type: filled_leg, price: exitPrice, qty: pos.qty, status: 'EXECUTED' as const, timestamp: new Date().toLocaleTimeString() }, ...ord]);
-                      }
-                      return prev.filter((p: any) => p.id !== entry_id);
-                  });
-              }
-              else if (message.type === 'ltp_update') {
-                  setLtpMap(prev => ({ ...prev, ...message.data }));
-              }
-              else if (message.type === 'history') {
-                if (message.target === 'index' || message.target === 'chart') setIndexChartData(message.data);
-              } else if (message.type === 'expiries') {
-                setExpiries(Array.isArray(message.data) ? message.data : []);
-                if (Array.isArray(message.data) && message.data.length > 0) setSelectedExpiry(message.data[0]);
-                setDhanConnected(true);
-                // Auto-save the working key so it auto-fills on next launch
-                if (dhanKeys?.client_id && dhanKeys?.access_token) {
-                  localStorage.setItem('dhan_keys', JSON.stringify(dhanKeys));
+    const handleMessage = (message: any) => {
+        try {
+            if (message.type === 'error') {
+                notify(message.message, 'error');
+                if (message.message.toLowerCase().includes('credentials') || message.message.toLowerCase().includes('failed to connect')) {
+                    setDhanConnected(false);
+                    addLog('Fatal Auth Error: Auto-reconnect aborted', 'error');
                 }
-              } else if (message.type === 'indices_spot') {
-                if (Array.isArray(message.data)) setIndicesSpot(message.data.filter((i: any) => i !== null));
-              } else if (message.type === 'data') {
-                if (message.ohlc) setLiveOhlc(message.ohlc);
-                setData((prev: any) => ({
-                    ...prev,
-                    ...message,
-                    spot: message.spot > 0 ? message.spot : prev.spot,
-                    market_on: !!message.market_on,
-                    market_status: message.market_status || 'closed',
-                    chain: Array.isArray(message.chain) && message.chain.length > 0 ? message.chain : prev.chain,
-                    gex: Array.isArray(message.gex) && message.gex.length > 0 ? message.gex : prev.gex,
-                }));
+            }
+            else if (message.type === 'oco_filled') {
+                const { entry_id, filled_leg, symbol, qty } = message.data;
+                const icon = filled_leg === 'TGT' ? '🎯' : '🛑';
+                addLog(`${icon} OCO ${filled_leg} FILLED: ${symbol} x${qty}`, filled_leg === 'TGT' ? 'success' : 'warn');
+                notify(`${icon} ${filled_leg} HIT — ${symbol} position closed by OCO`, filled_leg === 'TGT' ? 'success' : 'warn');
+                setPositions(prev => {
+                    const pos = prev.find((p: any) => p.id === entry_id);
+                    if (pos) {
+                        const exitPrice = filled_leg === 'TGT' ? (pos.targetPrice || pos.entryPrice) : (pos.slPrice || pos.entryPrice);
+                        const pnl = (exitPrice - pos.entryPrice) * pos.qty;
+                        setBookedPnl(bpnl => bpnl + pnl);
+                        setOrders(ord => [{ id: `OCO_${entry_id}`, action: 'SELL' as const, side: pos.side, strike: pos.strike, type: filled_leg, price: exitPrice, qty: pos.qty, status: 'EXECUTED' as const, timestamp: new Date().toLocaleTimeString() }, ...ord]);
+                    }
+                    return prev.filter((p: any) => p.id !== entry_id);
+                });
+            }
+            else if (message.type === 'ltp_update') {
+                setLtpMap(prev => ({ ...prev, ...message.data }));
+            }
+            else if (message.type === 'history') {
+              if (message.target === 'index' || message.target === 'chart') setIndexChartData(message.data);
+            } else if (message.type === 'expiries') {
+              setExpiries(Array.isArray(message.data) ? message.data : []);
+              if (Array.isArray(message.data) && message.data.length > 0) setSelectedExpiry(message.data[0]);
+              setDhanConnected(true);
+              if (dhanKeys?.client_id && dhanKeys?.access_token) {
+                localStorage.setItem('dhan_keys', JSON.stringify(dhanKeys));
               }
-            } catch (e: any) { addLog('WS Error: ' + e.message, 'warn'); }
-          };
-          socket.onclose = () => {
-            addLog('WS disconnected', 'warn');
-            currentReconnectTimeoutId = window.setTimeout(initiateConnection, 5000);
-          };
-      } catch (err: any) { currentReconnectTimeoutId = window.setTimeout(initiateConnection, 10000); }
+            } else if (message.type === 'indices_spot') {
+              if (Array.isArray(message.data)) setIndicesSpot(message.data.filter((i: any) => i !== null));
+            } else if (message.type === 'data') {
+              if (message.ohlc) setLiveOhlc(message.ohlc);
+              setData((prev: any) => ({
+                  ...prev,
+                  ...message,
+                  spot: message.spot > 0 ? message.spot : prev.spot,
+                  market_on: !!message.market_on,
+                  market_status: message.market_status || 'closed',
+                  chain: Array.isArray(message.chain) && message.chain.length > 0 ? message.chain : prev.chain,
+                  gex: Array.isArray(message.gex) && message.gex.length > 0 ? message.gex : prev.gex,
+              }));
+            }
+        } catch (e: any) { addLog('LocalServer Error: ' + e.message, 'warn'); }
     };
-    initiateConnection();
-    return () => {
-      if (currentWs) { currentWs.onclose = null; currentWs.close(); }
-      if (currentReconnectTimeoutId) window.clearTimeout(currentReconnectTimeoutId);
-    };
+
+    const unsubscribe = localAppServer.onMessage(handleMessage);
+    
+    if (dhanKeys?.client_id && dhanKeys?.access_token) {
+        localAppServer.handleMessage({ type: 'auth', payload: dhanKeys });
+    }
+
+    return () => unsubscribe();
   }, [dhanKeys, addLog, notify]);
 
   const handleExpiryChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const expiry = e.target.value;
     setSelectedExpiry(expiry);
-    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify({ type: 'select_expiry', payload: expiry }));
+    localAppServer.handleMessage({ type: 'select_expiry', payload: expiry });
   };
 
   const handleIndexChange = (indexId: string) => {
@@ -588,23 +522,23 @@ function App() {
     setIndexChartData([]); 
     const idxName = INDICES.find(i => i.id === indexId)?.name || 'INDEX';
     setChartName(idxName);
-    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify({ type: 'select_index', payload: indexId }));
+    localAppServer.handleMessage({ type: 'index_change', id: indexId });
   };
 
   const handleSelectInstrument = (inst: { id: string, name: string, type: 'INDEX' | 'OPT' }) => {
     setChartName(inst.name);
     setIndexChartData([]); 
-    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify({ type: 'select_chart_instrument', payload: inst }));
+    localAppServer.handleMessage({ type: 'select_chart_instrument', payload: inst });
   };
 
   const handleTimeframeChange = (tf: number | string) => {
     setSelectedTimeframe(tf);
-    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify({ type: 'select_timeframe', payload: tf }));
+    localAppServer.handleMessage({ type: 'timeframe_change', timeframe: tf });
   };
 
   const handleGexStrikesChange = (num: number) => {
     setGexStrikes(num);
-    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify({ type: 'select_gex_strikes', payload: num }));
+    localAppServer.handleMessage({ type: 'select_gex_strikes', payload: num });
   };
 
   const handleSaveSettings = async (dhan: any, mstock: any) => {
@@ -621,8 +555,7 @@ function App() {
 
   const handleRefreshPositions = async () => {
     try {
-        const res = await fetch('/api/mstock/positions');
-        const remotePositions = await res.json();
+        const remotePositions = await localAppServer.getPositions(mstockKeys?.user_id || '');
         notify(`SYNC COMPLETE: Found ${Array.isArray(remotePositions) ? remotePositions.length : 0} external positions`, 'success');
     } catch (e: any) { notify(`SYNC FAILED: ${e.message}`, 'error'); }
   };

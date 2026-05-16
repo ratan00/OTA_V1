@@ -4,6 +4,11 @@ const config: CapacitorConfig = {
   appId: 'com.trading.terminal',
   appName: 'Trading Terminal',
   webDir: 'dist',
+  plugins: {
+    CapacitorHttp: {
+      enabled: true,
+    },
+  },
   server: {
     androidScheme: 'https'
   }
